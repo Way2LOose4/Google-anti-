@@ -1,0 +1,1031 @@
+#!/usr/bin/env node
+// antigravity-armor 统一入口
+import { existsSync, readFileSync, readdirSync, mkdirSync, openSync, appendFileSync, rmSync } from 'node:fs'
+import { join, dirname } from 'node:path'
+import { execFileSync, spawnSync, spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import { loadConfig } from './config.mjs'
+import { readText, hasBom, expand, listBackups, writeText } from './util/fs.mjs'
+import { installBinary, verifyBinary, rollbackBinary } from './layers/binary.mjs'
+import { installRules, armorBody } from './layers/rules.mjs'
+import { scanRuleFiles, disarmAll } from './layers/rulescan.mjs'
+import { installHooks, buildHooksJson, discoverWorkspaces, hooksDrift } from './layers/hooks.mjs'
+import { installIde, rollbackIde, buildReplacement } from './layers/ide.mjs'
+import { ensureArmor, purgeSummary, stampIfAligned } from './purge/reapply.mjs'
+import { uninstallArmor } from './purge/uninstall.mjs'
+import { armorStatus, armorEdit, armorReset } from './purge/override.mjs'
+import { resolveKey } from './credentials.mjs'
+import { log } from './log.mjs'
+import { upstreamWarning, scanUpstream } from './diag/upstream.mjs'
+import { probeLanguageServers } from './diag/ls.mjs'
+import { netcheck } from './diag/net.mjs'
+import { readClash, assessRouting } from './diag/clash.mjs'
+import { tcpProbe, userEnvProxy, assessLsRoute, scanLsOutageFromDisk, lsNetcheck, LS_DIRECT_HOSTS } from './diag/lsnet.mjs'
+import { readJournal, summarizeJournal } from './layers/journal.mjs'
+import { startHud, snapshot, ensureToken, tokenPath, readLane, writeLane } from './hud/control.mjs'
+
+const argv = process.argv.slice(2)
+const cmd = argv[0]
+const flags = {}
+const positional = []
+for (const a of argv.slice(1)) {
+  if (a.startsWith('--')) { const [k, v] = a.slice(2).split('='); flags[k] = v === undefined ? true : v }
+  else positional.push(a)
+}
+const cfg = loadConfig()
+
+function netstat(port) {
+  try {
+    const out = execFileSync('powershell', ['-NoProfile', '-Command', `(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -eq ${port} } | Measure-Object).Count`], { encoding: 'utf8', timeout: 20000 })
+    return Number(out.trim()) > 0
+  } catch { return false }
+}
+
+async function status() {
+  const rows = []
+  // 二进制
+  const b = existsSync(cfg.binaryPath) ? verifyBinary(cfg) : null
+  rows.push(['binary', b ? (b.armored ? (b.clean ? 'ARMORED' : 'ARMORED (残留锚点 ' + b.remaining.length + ')') : 'not armored') : 'MISSING', cfg.binaryPath])
+  // IDE
+  let ideState = 'MISSING'
+  if (existsSync(cfg.asarPath)) {
+    const buf = readFileSync(cfg.asarPath)
+    ideState = buf.includes(Buffer.from(buildReplacement(cfg), 'utf8')) ? 'PATCHED -> localhost' : (buf.includes(Buffer.from(cfg.ide.endpointFind, 'utf8')) ? 'original (points at Google)' : 'unknown')
+  }
+  rows.push(['ide', ideState, cfg.asarPath])
+  const idePatched = ideState === 'PATCHED -> localhost'
+  // rules
+  const ruleFiles = cfg.rules.globalFiles.map(expand).filter(existsSync)
+  rows.push(['rules', ruleFiles.length + '/' + cfg.rules.globalFiles.length + ' files', ruleFiles.join(' , ')])
+  rows.push(['skill', existsSync(expand(cfg.rules.skillFile)) ? 'present' : 'missing', expand(cfg.rules.skillFile)])
+  // hooks
+  const hookDirs = [...(cfg.hooks.globalRoots || []).map(expand), ...discoverWorkspaces(cfg).map((w) => join(w, '.agents'))]
+  let ok = 0, bom = 0
+  for (const d of hookDirs) {
+    const p = join(d, 'hooks.json')
+    if (!existsSync(p)) continue
+    if (hasBom(p)) bom++
+    if (readText(p).includes('armor-allow-all')) ok++
+  }
+  rows.push(['hooks', ok + ' installed' + (bom ? ', ' + bom + ' WITH BOM (broken!)' : ''), hookDirs.length + ' candidate roots'])
+  // 钩子脚本漂移：assets 是事实来源，state/hooks 是部署副本。对不上就是「改了源码但线上跑的还是旧脚本」——
+  // 实测发生过一次静默失效（源码 3.7KB / 部署 1.9KB），而 status 全绿。所以这一项必须出现在总览里。
+  const drift = hooksDrift(cfg)
+  const drifted = drift.filter((d) => d.drift).map((d) => d.file)
+  rows.push(['hook scripts', drifted.length ? drifted.length + ' DRIFTED' + (drifted.length ? ' (' + drifted.join(',') + ')' : '') : 'in sync', join(cfg.stateDir, 'hooks')])
+  // purge 状态（v1.9.0）：ensure 的判据 —— 戳对齐 / 逐层漂移 / 冷却窗
+  let purge = null
+  try {
+    purge = purgeSummary(cfg, {})
+    const s = purge.stamp
+    const bits = []
+    if (s) bits.push('v' + s.armorVersion + ' @ ' + String(s.at || '').slice(0, 19).replace('T', ' '))
+    if (purge.cooldown) bits.push('settle 冷却中')
+    if (purge.bodyStale) bits.push('armor 正文已变')
+    if (purge.blocked.length) bits.push('blocked=' + purge.blocked.map((b) => b.layer + ':' + b.reason).join(','))
+    rows.push([
+      'purge',
+      purge.aligned ? 'ALIGNED' : (s ? 'DRIFT pending=' + purge.pending : 'never applied'),
+      bits.join(' / ') || 'run: aarmor ensure --apply',
+    ])
+  } catch (e) {
+    rows.push(['purge', 'ERROR', e.message])
+  }
+  // divert / ls
+  const divertUp = netstat(Number(cfg.divert.port))
+  rows.push(['divert', divertUp ? 'LISTENING :' + cfg.divert.port : 'down', cfg.divert.passThrough ? 'pass-through -> ' + cfg.divert.upstream : cfg.divert.target + ' model=' + cfg.divert.model])
+  // ls：以**真实进程**为准。IDE 自己拉起的 LS 不在我们的 pid 文件里，
+  // 只读 pid 文件会把在跑的 LS 误报成 down（与「divert 全绿但代理已死」同类误导）。
+  const pidFile = join(cfg.stateDir, 'ls.pid')
+  let lsState = 'down'
+  if (existsSync(pidFile)) {
+    const pid = readText(pidFile).trim()
+    try { process.kill(Number(pid), 0); lsState = 'ours pid=' + pid } catch { lsState = 'stale pid file' }
+  }
+  let lsProbe = { count: 0, viaDivert: 0, entries: [], summary: '未探到' }
+  try { lsProbe = probeLanguageServers(Number(cfg.divert.port)) } catch {}
+  const lsCell = lsProbe.count ? lsProbe.summary : lsState
+  rows.push(['ls', lsCell, lsProbe.count ? 'language_server.exe（真实进程）' : join(cfg.logDir, 'language_server.log')])
+  if (idePatched && lsProbe.count && lsProbe.viaDivert === 0) {
+    rows.push(['⚠ ls↔divert', '未发现指向 divert 的 LS', 'L4 补丁可能已被 IDE 更新覆盖，跑 install --layer=ide']) 
+  }
+  // 语言服务器直连出站（v1.8.4）：L1–L5 只覆盖 `v1internal:*` 那条被改道的通道，
+  // OAuth 换令牌 / 遥测 / 用户信息三个口子硬编码在 LS 里、**直连 Google**。它们断了，
+  // 请求在「发出去之前」就失败 —— divert 全绿也照样弹 "network issue"（2026-09-20 现场）。
+  // 探测放在这里会花掉最慢那个的 1.5 秒，换来的是「status 说 ok 而 IDE 在报错」这个盲区被堵上。
+  const lsEnvProxy = userEnvProxy()
+  const lsDirect = await tcpProbe('oauth2.googleapis.com', 443, { timeoutMs: 1500 })
+  const lsOutage = scanLsOutageFromDisk(cfg)
+  const lsRoute = assessLsRoute({ directOk: lsDirect.ok, envProxy: lsEnvProxy, outage: lsOutage })
+  rows.push([
+    'ls 出站',
+    (lsRoute.ok ? (lsDirect.ok ? '直连可达' : '靠环境变量代理') : 'NO ROUTE') + (lsOutage.active ? ' +' + lsOutage.count + ' 报错中' : ''),
+    'oauth2 直连 ' + (lsDirect.ok ? lsDirect.ms + 'ms' : '不通') + ' / 用户级代理 ' + (lsEnvProxy.present ? lsEnvProxy.https : '未配'),
+  ])
+  // 上游健康判读（v1.7.5）：401/429/503 三类故障在 status 里直接说清楚，
+  // 免得「Agent terminated due to error」被误当成装甲失效。
+  rows.push(['key ' + cfg.divert.keyRef, resolveKey(cfg, cfg.divert.keyRef) ? 'resolved' : 'MISSING', '~/.dsh/.credentials.yaml refs'])
+
+  const divertLog = join(cfg.logDir, 'divert.log')
+  let upWarn = null
+  if (divertUp && existsSync(divertLog)) {
+    try {
+      const tailText = readText(divertLog).split('\n').slice(-600).join('\n')
+      upWarn = upstreamWarning(tailText)
+    } catch {}
+  }
+
+  const w = Math.max(...rows.map((r) => r[0].length))
+  console.log('\nAntigravity armor — status\n' + '─'.repeat(60))
+  for (const [k, v, p] of rows) console.log('  ' + k.padEnd(w) + '  ' + String(v).padEnd(34) + '  ' + p)
+  // 致命组合必须喊出来：IDE 已被指向本地代理，而代理不在 —— 连账号都登录不上
+  // （实测报错：dial tcp 127.0.0.1:50100: connectex: No connection could be made）
+  if (idePatched && !divertUp) {
+    console.log('\n⚠ IDE 已指向 127.0.0.1:' + cfg.divert.port + '，但代理不在监听 —— 此刻连账号登录都会失败。')
+    console.log('  立刻恢复：node src/cli.mjs divert start')
+    console.log('  永久保活：node src/cli.mjs divert autostart install')
+  }
+  // 第三类致命组合（v1.8.4）：代理活着但 key 缺失 —— 降级为仅透传，登录能用，
+  // 但所有改道请求 503。此前这个状态直接起不来（崩溃循环），现在至少要让人看见降级了。
+  if (divertUp && !resolveKey(cfg, cfg.divert.keyRef)) {
+    console.log('\n⚠ divert 在降级运行（缺 ' + cfg.divert.keyRef + '）：登录/账号接口照常，改道请求一律 503。')
+    console.log('  把 key 加回 ~/.dsh/.credentials.yaml refs（参考 .bak 备份）或设置同名环境变量，然后 divert stop && divert start。')
+  }
+  // 第二类致命组合（v1.8.4）：divert 活着、上游健康，但 **LS 自己出不去**。
+  // 2026-09-20 现场：IDE 弹 "There was a network issue connecting to the server"，
+  // 而这一页当时是全绿的 —— 因为 divert 是 Node（读 HTTPS_PROXY）所以它照旧通，
+  // 出不去的是 Go 的语言服务器（不读注册表系统代理）。
+  if (!lsRoute.ok || lsOutage.active) {
+    console.log('\n⚠ 语言服务器出站：' + lsRoute.verdict)
+    if (lsOutage.path) console.log('  取证（' + lsOutage.path + '）：' + (lsOutage.last ? lsOutage.last.line.slice(0, 180) : '-'))
+    for (const h of lsRoute.hints) console.log('  ' + h)
+    console.log('  细看：node src/cli.mjs lsnet')
+  }
+  if (upWarn) {
+    const mark = upWarn.verdict === 'auth' ? '⚠ 账号态' : upWarn.verdict === 'quota' ? '⚠ 配额' : '⚠ 上游'
+    console.log('\n' + mark + ' ' + upWarn.line)
+    console.log('  ' + upWarn.hint)
+    if (upWarn.verdict === 'auth') console.log('  判据：路径/剥离字节数与成功那次完全一致，唯一变量是令牌 —— 不是破甲问题。')
+  } else if (divertUp) {
+    console.log('\n上游健康：最近一次请求是 200（代理链路正常）。')
+  }
+  if (purge && purge.stamp && purge.stamp.pendingRestart) {
+    console.log('\n⚠ 上次 ensure 重打过 binary/asar —— 需重启 Antigravity 生效（asar 只在启动时读）。')
+  }
+  if (purge && !purge.aligned && !purge.stamp) {
+    console.log('\n提示：还没有 purge 戳 —— 先跑一次 aarmor ensure --apply。')
+  }
+  console.log('')
+}
+
+async function verify() {
+  const r = verifyBinary(cfg)
+  const ps = (() => { try { return purgeSummary(cfg, {}) } catch (e) { return { error: String(e.message || e) } } })()
+  const out = {
+    binary: { path: cfg.binaryPath, armored: r.armored, length: r.length, remainingAnchors: r.remaining, clean: r.clean },
+    ide: { path: cfg.asarPath, patched: existsSync(cfg.asarPath) && readFileSync(cfg.asarPath).includes(Buffer.from(buildReplacement(cfg), 'utf8')) },
+    rules: cfg.rules.globalFiles.map(expand).map((p) => ({ path: p, exists: existsSync(p), bom: existsSync(p) && hasBom(p) })),
+    hooks: [...(cfg.hooks.globalRoots || []).map(expand)].map((d) => {
+      const p = join(d, 'hooks.json')
+      return { path: p, exists: existsSync(p), bom: existsSync(p) && hasBom(p), valid: existsSync(p) ? (() => { try { JSON.parse(readText(p)); return true } catch { return false } })() : false }
+    }),
+    // 脚本副本漂移：assets vs state/hooks —— 对不上就是「源码改了、线上跑的仍是旧脚本」
+    hookScripts: hooksDrift(cfg).map(({ file, drift, srcSha, dstSha }) => ({ file, drift, srcSha, dstSha })),
+    backups: listBackups(cfg.backupDir).slice(0, 5).map((b) => b.name),
+    // purge 段（v1.9.0）：戳、宿主 rev、逐层 pending —— `ensure` 的全部判据都在这
+    purge: ps.error ? { error: ps.error } : {
+      stamp: ps.stamp,
+      revs: ps.revs,
+      aligned: ps.aligned,
+      pending: ps.pending,
+      blocked: ps.blocked,
+      bodyStale: ps.bodyStale,
+      cooldown: ps.cooldown,
+      layers: Object.fromEntries(Object.entries(ps.statuses).map(([k, v]) => [k, { pending: v.pending || 0, blocked: v.blocked || null }])),
+    },
+  }
+  if (flags.json) console.log(JSON.stringify(out, null, 2))
+  else log.info(JSON.stringify(out, null, 2))
+  return out
+}
+
+async function install() {
+  const apply = !!flags.apply
+  const layer = flags.layer || 'all'
+  log.step('install (' + (apply ? 'APPLY' : 'DRY RUN') + ') layer=' + layer)
+  const ws = flags.workspaces ? String(flags.workspaces).split(',') : null
+  const res = {}
+  if (layer === 'all' || layer === 'rules') res.rules = installRules(cfg, { apply, workspaces: ws || discoverWorkspaces(cfg) })
+  if (layer === 'all' || layer === 'hooks') res.hooks = installHooks(cfg, { apply, workspaces: ws })
+  if (layer === 'all' || layer === 'binary') { log.step('binary (41 injection points)'); res.binary = installBinary(cfg, { apply }) }
+  if (layer === 'all' || layer === 'ide') { log.step('ide endpoint'); res.ide = installIde(cfg, { apply }) }
+  if (!apply) { log.warn('dry run — 加 --apply 才写入'); return res }
+  // v1.9.0：落盘后打 purge 戳（与 ensure 同一套判据）。未对齐就不写假戳。
+  try {
+    const st = stampIfAligned(cfg, {
+      workspaces: ws || discoverWorkspaces(cfg),
+      pendingRestart: !!(res.binary?.applied || res.ide?.patched),
+    })
+    if (st.stamped) log.ok('purge 戳已写入 v' + st.stamp.armorVersion)
+    else log.warn('purge 未对齐：pending=' + st.pending + ' —— 跑 aarmor ensure --apply 排查')
+  } catch (e) {
+    log.warn('purge 打戳失败：' + e.message)
+  }
+  return res
+}
+
+function divert(action) {
+  const port = Number(flags.port || cfg.divert.port)
+  const running = netstat(port)
+  if (action === 'status' || !action) {
+    // 配置里的模型 ≠ 进程实际在用的模型（切换模型只重启进程不改配置），所以两个都报
+    let liveModel = null
+    try {
+      const ps = execFileSync('powershell', ['-NoProfile', '-Command', "Get-CimInstance Win32_Process -Filter \"Name = 'node.exe'\" | Where-Object { $_.CommandLine -like '*divert run*' } | Select-Object -First 1 -ExpandProperty CommandLine"], { encoding: 'utf8', timeout: 20000 })
+      liveModel = (ps.match(/--model=(\S+)/) || [])[1] || null
+    } catch {}
+    const lp = join(cfg.logDir, 'divert.log')
+    let lastModel = null
+    if (existsSync(lp)) {
+      const ms = [...readText(lp).matchAll(/model=([\w.-]+)/g)]
+      lastModel = ms.length ? ms[ms.length - 1][1] : null
+    }
+    const sm = !!cfg.divert.sameModel
+    const pt = !!cfg.divert.passThrough
+    console.log('divert :' + port + ' -> ' + (running ? 'LISTENING' : 'down') + '  ' + (sm ? 'same-model 同模型重试 upstream=' + cfg.divert.upstream : pt ? 'pass-through 原模型直通 upstream=' + cfg.divert.upstream : 'target=' + cfg.divert.target))
+    if (pt) console.log('  模式: 中间层零换模型 —— 整形直通：出站剥自家装甲 + BLOCK_NONE + 拦截同模型重发')
+    else {
+      console.log('  config model : ' + cfg.divert.model)
+      console.log('  live   model : ' + (liveModel || '(未运行)') + (lastModel && lastModel !== liveModel ? '   [最近日志用的: ' + lastModel + ']' : ''))
+    }
+    if (existsSync(lp)) console.log('recent:\n' + readText(lp).split('\n').slice(-8).join('\n'))
+    return
+  }
+  if (action === 'stop') {
+    // 之前这里引号写错（Name='node.exe 少一个引号），PowerShell 直接抛 InvalidArgument，stop 从未生效过
+    const ps = "Get-CimInstance Win32_Process -Filter \"Name = 'node.exe'\" | Where-Object { $_.CommandLine -like '*divert run*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+    spawnSync('powershell', ['-NoProfile', '-Command', ps], { stdio: 'inherit', timeout: 30000 })
+    return
+  }
+  if (action === 'start') {
+    if (running) { log.warn('already listening on ' + port); return }
+    spawnDivert(port)
+    return
+  }
+  if (action === 'ensure') return ensureDivert(port)
+  if (action === 'watchdog') return runWatchdog(port)
+  if (action === 'autostart') return divertAutostart(positional[1] || 'status')
+  if (action === 'run') return runDivert(port)
+  // 文档里一直是 `divert restart --model=…`，但以前没有这个分支（命令静默无操作）。
+  if (action === 'restart') {
+    divert('stop')
+    return divert('start')
+  }
+  // 同上：`divert log | Select-String …` 是取证常用姿势，以前也没接线。
+  if (action === 'log') {
+    const lp = join(cfg.logDir, 'divert.log')
+    if (!existsSync(lp)) { log.warn('没找到 ' + lp); return }
+    console.log(readText(lp).split('\n').slice(-Number(flags.tail || flags.lines || 200)).join('\n'))
+    return
+  }
+}
+
+/** 语言服务器出站体检（v1.8.4）—— 专治「五层全绿，IDE 还弹 network issue」。
+ *  两个必须分开回答的问题：
+ *    1) **直连**（LS 真正走的那条路）通不通？—— 不经任何代理，因为 Go 二进制不读注册表系统代理
+ *    2) LS 有没有拿到能用的环境变量代理？—— 这是它唯一能走代理的途径
+ *  现场（2026-09-20）：直连不通、用户级代理未配、Clash 的 TUN 与系统代理都关着，
+ *  divert（Node，读 HTTPS_PROXY）照旧 200 —— 于是 status 全绿而 GUI 报错。 */
+async function lsnetCmd() {
+  const timeoutMs = Number(flags.timeout || 4000)
+  console.log('\n语言服务器出站体检\n' + '─'.repeat(60))
+  const r = await lsNetcheck(cfg, { timeoutMs })
+  console.log('  直连（LS 真正走的那条路，不经任何代理）')
+  for (const row of r.direct.rows) console.log('    ' + row.host.padEnd(28) + (row.ok ? '通 ' + row.ms + 'ms' : '不通 (' + row.ms + 'ms)') + '   ' + row.what)
+  console.log('  用户级环境变量代理（LS 启动时继承的就是它；注册表里的系统代理它看不见）')
+  console.log('    HTTPS_PROXY : ' + (r.envProxy.https || '(未配)'))
+  console.log('    NO_PROXY    : ' + (r.envProxy.no || '(未配)'))
+  console.log('  LS 日志判读')
+  console.log('    文件 : ' + (r.outage.path || '(找不到)'))
+  console.log('    判读 : ' + r.outage.verdict + (r.outage.active ? '   ← 正在发生' : ''))
+  for (const h of r.outage.hits) console.log('      ' + (h.at ? h.at.toTimeString().slice(0, 8) + '  ' : '') + h.kind.padEnd(12) + h.line.slice(0, 130))
+  console.log('\n判读: ' + (r.assessment.ok ? '✅ ' : '⚠ ') + r.assessment.verdict)
+  for (const h of r.assessment.hints) console.log('  ' + h)
+  console.log('')
+}
+
+/** 出口网络体检（v1.7.7）：回答两个不同的问题
+ *   1) divert 的流量到底有没有走代理？（Node 不读系统代理 —— 最容易漏的一环）
+ *   2) 出口 IP 本身能不能用？（机房 ASN 信誉 / 国家是否受限）
+ *  现场：用户怀疑「流量没经过 Clash」，实测三条路径出口一致（Clash 生效），
+ *  真正的问题是出口是 Vultr 机房 IP（AS20473，被第三方判 bad network reputation）。 */
+async function netcheckCmd() {
+  const proxy = flags.proxy || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || ''
+  console.log('\n出口网络体检\n' + '─'.repeat(60))
+  console.log('  显式代理: ' + (proxy || '(未设置 HTTPS_PROXY/HTTP_PROXY)'))
+  const r = await netcheck({ proxyUrl: proxy })
+  console.log('  divert 直连出口 IP : ' + (r.direct || '(取不到)'))
+  console.log('  显式走代理出口 IP  : ' + (r.viaProxy || '(取不到)'))
+  if (r.nodeEgressEqualsProxy === true) console.log('  → 一致：divert 的流量**确实**经过代理')
+  else if (r.nodeEgressEqualsProxy === false) console.log('  → **不一致**：divert 在直连，代理没吃到它的流量')
+  else console.log('  → 无法比对（有一侧取不到）')
+  const g = r.geo || {}
+  console.log('\n  归属: ' + [g.country, g.city, g.isp].filter(Boolean).join(' / '))
+  console.log('  ASN : ' + (g.as || '-') + (g.hosting ? '   [hosting/datacenter]' : ''))
+  const a = r.assessment
+  console.log('\n判读: ' + (a.ok ? '✅ ' : '⚠ ') + a.verdict)
+  for (const h of a.hints) console.log('  ' + h)
+
+  // 路由实况：谁在真正承载流量？（"节点写着德国却走了日本"这类问题在这一段定案）
+  const c = await readClash({ timeoutMs: 3000 })
+  console.log('\n路由实况（问 Clash 自己）')
+  if (!c.ok) {
+    console.log('  ' + c.reason)
+  } else {
+    console.log('  接口: ' + c.via)
+    for (const g of c.groups) console.log('  ' + g.name.padEnd(10) + ' [' + g.type + ']  now = ' + g.now)
+    if (c.nodes.length) console.log('  节点: ' + c.nodes.map((n) => n.name + (n.delay != null ? '(' + n.delay + 'ms)' : '')).join('  '))
+    const routing = assessRouting({ groups: c.groups, connections: c.connections, exitCountry: (r.geo && r.geo.countryCode) || null })
+    const gconn = c.connections.filter((x) => /googleapis|google\.com|cloudcode/i.test(String(x.host)))
+    if (gconn.length) {
+      console.log('  Google 类流量实际链路:')
+      for (const x of gconn.slice(0, 4)) console.log('    ' + String(x.host).slice(0, 42).padEnd(44) + ' → ' + JSON.stringify(x.chains))
+    } else console.log('  （当前没有 Google 类活连接）')
+    console.log('  → 真正承载: ' + (routing.nodeName || '(未知)'))
+    for (const w of routing.warns) console.log('  ' + w)
+  }
+  for (const e of r.errors) console.log('  (取数失败: ' + e + ')')
+
+  // LS 的出口是**另一条路**（v1.8.4）：这段里的 divert 出口全是 Node 的，
+  // 而语言服务器是 Go 二进制 —— 它不读系统代理、只读环境变量，两者结论可以完全相反。
+  const lsx = await lsNetcheck(cfg, { timeoutMs: 3000 })
+  console.log('\n语言服务器那条路（直连，不走 Clash「系统代理」）')
+  for (const row of lsx.direct.rows) console.log('  ' + row.host.padEnd(28) + (row.ok ? '通 ' + row.ms + 'ms' : '不通'))
+  console.log('  用户级 HTTPS_PROXY: ' + (lsx.envProxy.https || '(未配)'))
+  console.log('  LS 日志: ' + (lsx.outage.path || '(找不到)') + '  → ' + lsx.outage.verdict)
+  for (const h of lsx.assessment.hints) console.log('  ' + h)
+  console.log('')
+}
+
+/** 常驻看门狗（v1.7.3）：每 5 分钟检查一次，代理不在就拉起。
+ *  这是唯一能覆盖「会话运行中代理崩掉」的机制 —— 计划任务只在登录/定时触发，
+ *  而 IDE 一旦拿不到 127.0.0.1:50100，连账号都登录不上。 */
+async function runWatchdog(port) {
+  const logFile = join(cfg.logDir, 'divert-watchdog.log')
+  const every = Math.max(10, Number(flags.interval || cfg.divert.watchdogSeconds || 300)) * 1000
+  const note = (m) => { try { mkdirSync(cfg.logDir, { recursive: true }); appendFileSync(logFile, new Date().toISOString() + '  ' + m + '\n') } catch {} }
+  note('watchdog 启动 pid=' + process.pid + ' 端口=' + port + ' 间隔=' + every / 1000 + 's')
+  const tick = () => {
+    try {
+      autoEnsureLayers()
+      if (!netstat(port)) { note('代理不在监听 -> 拉起'); spawnDivert(port) }
+    } catch (e) { note('检查失败: ' + e.message) }
+  }
+  tick()
+  setInterval(tick, every)
+  await new Promise(() => {}) // 常驻
+}
+
+/** 幂等保活：在监听就什么都不做、静默退出 0（专供计划任务调用）。
+ *  v1.9.0：顺带做层自愈 —— Antigravity 升级后不必等人记起 install --apply。 */
+function ensureDivert(port) {
+  autoEnsureLayers()
+  if (netstat(port)) return
+  spawnDivert(port)
+}
+
+/** 层自愈（cfg.purge.autoEnsure）。已对齐时只读；失败只记日志，绝不影响 divert 保活。 */
+function autoEnsureLayers() {
+  if (cfg.purge?.autoEnsure === false) return
+  try {
+    Promise.resolve(ensureArmor(cfg, { apply: true })).then((res) => {
+      if (res.noop) return
+      const line = new Date().toISOString() + '  ensure: ok=' + res.ok + ' changed=' + (res.changed.join(',') || '-')
+        + (res.deferred.length ? ' deferred=' + res.deferred.map((d) => d.layer).join(',') : '')
+        + (res.blocked.length ? ' blocked=' + res.blocked.map((b) => b.layer).join(',') : '')
+        + ' | ' + res.notes.join(' | ')
+      try { mkdirSync(cfg.logDir, { recursive: true }); appendFileSync(join(cfg.logDir, 'divert-ensure.log'), line + '\n') } catch {}
+    }).catch((e) => log.warn('ensure: ' + (e && e.message ? e.message : e)))
+  } catch (e) {
+    log.warn('ensure: ' + e.message)
+  }
+}
+
+function spawnDivert(port) {
+  const logFile = join(cfg.logDir, 'divert.log')
+  // 必须用异步 spawn：spawnSync 会一直等这个常驻服务退出，导致 CLI 卡死
+  // v1.6.4：stderr/stdout 落文件 —— 此前 stdio:'ignore' 把崩溃堆栈整个丢掉，
+  // 现场只剩「日志停在某个请求上、进程没了」，无法定案。
+  const errFile = join(cfg.logDir, 'divert-stderr.log')
+  mkdirSync(cfg.logDir, { recursive: true })
+  const errFd = openSync(errFile, 'a')
+  const selfPath = fileURLToPath(import.meta.url)
+  const args = [selfPath, 'divert', 'run', '--port=' + port, '--model=' + (flags.model || cfg.divert.model)]
+  // --target 以前没透传：`divert restart --target=…` 会静默沿用配置里的旧 target
+  if (flags.target) args.push('--target=' + flags.target)
+  const child = spawn(process.execPath, args, { detached: true, stdio: ['ignore', errFd, errFd], windowsHide: true })
+  child.unref()
+  log.ok('divert spawned (pid ' + child.pid + '), log: ' + logFile + ', stderr: ' + errFile)
+  // v1.8.4：拉起后探活。此前 spawn 完就当成功 —— 可代理若因缺 key / 端口被占而秒崩，
+  // watchdog 日志里永远只有「代理不在监听 -> 拉起」，永远看不到「拉起后又死了、为什么死」，
+  // 2026-09-30 现场（credentials.yaml 丢 key）每 5 分钟白拉一次，连着拉了一下午。
+  // 3 秒足够正常进程完成 key 解析并 listen；还活着才算拉起成功，死了就把 stderr 尾巴摘进探活记录。
+  const note = (m) => { try { mkdirSync(cfg.logDir, { recursive: true }); appendFileSync(join(cfg.logDir, 'divert-spawn.log'), new Date().toISOString() + '  ' + m + '\n') } catch {} }
+  setTimeout(() => {
+    let alive = true
+    try { process.kill(child.pid, 0) } catch { alive = false }
+    if (alive) { note('spawn pid=' + child.pid + ' 存活（已监听或正在启动）'); return }
+    let tail = ''
+    try { tail = readText(errFile).split('\n').filter(Boolean).slice(-4).join(' | ') } catch {}
+    note('spawn pid=' + child.pid + ' 已退出 ← stderr: ' + (tail || '(空)'))
+    log.warn('divert 进程 ' + child.pid + ' 拉起后 3 秒内退出，原因见 ' + join(cfg.logDir, 'divert-spawn.log'))
+  }, 3000).unref?.()
+}
+
+/** 自启保活（v1.7.3）：divert 不是服务，重启/注销/崩溃都会让它消失，
+ *  而 app.asar 已经被指向 127.0.0.1:50100 —— 代理一没，**连账号都登录不上**
+ *  （实测报错：`dial tcp 127.0.0.1:50100: connectex: No connection could be made`）。
+ *  用一个 .cmd 包一层再挂计划任务：登录时拉起 + 每 5 分钟兜底 ensure。 */
+const AUTOSTART_TASK_ONLOGON = 'AntigravityArmor-Divert-AtLogon'
+const AUTOSTART_TASK_WATCHDOG = 'AntigravityArmor-Divert-Watchdog'
+
+function autostartCmdPath() {
+  return join(cfg.stateDir, 'divert-ensure.cmd')
+}
+
+function autostartVbsPath() {
+  return join(cfg.stateDir, 'divert-silent.vbs')
+}
+
+function divertAutostart(sub) {
+  const cmd = autostartCmdPath()
+  const vbs = autostartVbsPath()
+  const selfPath = fileURLToPath(import.meta.url)
+  const mkCmd = () => {
+    mkdirSync(cfg.stateDir, { recursive: true })
+    const body = [
+      '@echo off',
+      'rem 由 `aarmor divert autostart install` 生成 —— 幂等保活，代理在监听时静默退出',
+      '"' + process.execPath + '" "' + selfPath + '" divert ensure >> "' + join(cfg.logDir, 'divert-ensure.log') + '" 2>&1',
+      '',
+    ].join('\r\n')
+    writeText(cmd, body)
+    const vbsBody = [
+      'Set ws = CreateObject("WScript.Shell")',
+      'ws.Run "cmd /c """ & "' + cmd + '" & """", 0, False',
+      '',
+    ].join('\r\n')
+    writeText(vbs, vbsBody)
+    return { cmd, vbs }
+  }
+  const query = (tn) => {
+    try {
+      const out = execFileSync('schtasks', ['/Query', '/TN', tn], { encoding: 'utf8', timeout: 20000, stdio: ['ignore', 'pipe', 'ignore'] })
+      return /Ready|Running|就绪|正在运行/i.test(out) ? 'installed' : 'present'
+    } catch { return 'missing' }
+  }
+  const startupDir = join(process.env.APPDATA || '', 'Microsoft/Windows/Start Menu/Programs/Startup')
+  const startupFile = join(startupDir, 'AntigravityArmor-Divert.cmd')
+  const startupVbsFile = join(startupDir, 'AntigravityArmor-Divert.vbs')
+  if (sub === 'status' || !sub) {
+    console.log('divert autostart')
+    console.log('  at logon  : ' + query(AUTOSTART_TASK_ONLOGON) + '  (' + AUTOSTART_TASK_ONLOGON + ')')
+    console.log('  watchdog  : ' + query(AUTOSTART_TASK_WATCHDOG) + '  (' + AUTOSTART_TASK_WATCHDOG + ', 每 5 分钟)')
+    console.log('  启动文件夹: ' + (existsSync(startupFile) || existsSync(startupVbsFile) ? 'installed' : 'missing'))
+    console.log('  wrapper   : ' + (existsSync(cmd) ? cmd : '(未生成)'))
+    console.log('  silent vbs: ' + (existsSync(vbs) ? vbs : '(未生成)'))
+    try {
+      const ps = execFileSync('powershell', ['-NoProfile', '-Command', "Get-CimInstance Win32_Process -Filter \"Name = 'node.exe'\" | Where-Object { $_.CommandLine -like '*divert watchdog*' } | Select-Object -First 1 -ExpandProperty ProcessId"], { encoding: 'utf8', timeout: 20000 })
+      console.log('  看门狗进程: ' + (ps.trim() ? 'running pid=' + ps.trim() : 'down'))
+    } catch { console.log('  看门狗进程: 未知') }
+    return
+  }
+  if (sub === 'install') {
+    const { cmd: p, vbs: v } = mkCmd()
+    // 计划任务使用 wscript.exe 无窗静默调用，杜绝每 5 分钟黑框闪退
+    const tr = 'wscript.exe //B "' + v + '"'
+    const mk = (tn, sc, mo) => {
+      const args = ['/Create', '/TN', tn, '/TR', tr, '/SC', sc, '/RL', 'LIMITED', '/F']
+      if (mo) args.push('/MO', String(mo))
+      const r = spawnSync('schtasks', args, { encoding: 'utf8', timeout: 30000 })
+      return r.status === 0
+    }
+    const a = mk(AUTOSTART_TASK_ONLOGON, 'ONLOGON')
+    const b = mk(AUTOSTART_TASK_WATCHDOG, 'MINUTE', 5)
+    if (a && b) {
+      try { rmSync(startupFile, { force: true }) } catch {}
+      try { rmSync(startupVbsFile, { force: true }) } catch {}
+      log.ok('计划任务已装（静默无窗）：登录自启 + 每 5 分钟兜底')
+    } else {
+      mkdirSync(startupDir, { recursive: true })
+      try { rmSync(startupFile, { force: true }) } catch {}
+      const node = process.execPath
+      const self = fileURLToPath(import.meta.url)
+      writeText(startupVbsFile, [
+        'Set ws = CreateObject("WScript.Shell")',
+        'ws.Run "powershell -NoProfile -WindowStyle Hidden -Command ""Start-Process -FilePath \'' + node + '\' -ArgumentList \'' + self + '\',\'divert\',\'watchdog\' -WindowStyle Hidden""", 0, False',
+        '',
+      ].join('\r\n'))
+      log.ok('计划任务不可用（需要管理员），已改用启动文件夹静默 VBS + 常驻看门狗：' + startupVbsFile)
+      // 立刻拉起看门狗，本次会话就已经受保护（不必等下次登录）
+      const selfPath = fileURLToPath(import.meta.url)
+      const child = spawn(process.execPath, [selfPath, 'divert', 'watchdog'], { detached: true, stdio: 'ignore', windowsHide: true })
+      child.unref()
+      log.ok('看门狗已立即启动 (pid ' + child.pid + ')')
+    }
+    console.log('\n保活语义：登录自动拉起 + 每 5 分钟检查一次（在监听就静默跳过，无弹窗）。')
+    console.log('查看：node src/cli.mjs divert autostart status')
+    return
+  }
+  if (sub === 'uninstall') {
+    for (const tn of [AUTOSTART_TASK_ONLOGON, AUTOSTART_TASK_WATCHDOG]) {
+      spawnSync('schtasks', ['/Delete', '/TN', tn, '/F'], { encoding: 'utf8', timeout: 20000 })
+    }
+    try { rmSync(startupFile, { force: true }) } catch {}
+    spawnSync('powershell', ['-NoProfile', '-Command', "Get-CimInstance Win32_Process -Filter \"Name = 'node.exe'\" | Where-Object { $_.CommandLine -like '*divert watchdog*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"], { timeout: 20000 })
+    log.ok('已移除自启与看门狗（wrapper 文件保留：' + cmd + '）')
+    return
+  }
+}
+
+async function runDivert(port) {
+  const { startDivert } = await import('./layers/divert.mjs')
+  await startDivert(cfg, { port, model: flags.model || cfg.divert.model, target: flags.target || cfg.divert.target, logFile: join(cfg.logDir, 'divert.log') })
+}
+
+async function ls(action) {
+  if (action === 'start') {
+    const { launchLS, readLsPorts } = await import('./driver/ls.mjs')
+    // --backend= 可指定模型后端：默认走本地改道代理；传官方地址即为"对照组"（未经装甲的原生通道）
+    const { proc, pid, logFile, args } = launchLS(cfg, { port: Number(flags.port || 50095), csrf: flags.csrf || 'aarmor', backend: flags.backend || null })
+    const ports = await readLsPorts(logFile)
+    console.log(JSON.stringify({ pid, ports, args }, null, 2))
+    if (ports) console.log('\n用这个驱动:\n  $env:ANTIGRAVITY_LS_ADDRESS=\'localhost:' + ports.http + '\'\n  $env:ANTIGRAVITY_CSRF_TOKEN=\'' + (flags.csrf || 'aarmor') + '\'')
+    process.exit(0)
+  }
+  if (action === 'stop') {
+    const pidFile = join(cfg.stateDir, 'ls.pid')
+    if (existsSync(pidFile)) { try { process.kill(Number(readText(pidFile).trim())) } catch {} }
+    spawnSync('powershell', ['-NoProfile', '-Command', "Get-Process -Name language_server -ErrorAction SilentlyContinue | Stop-Process -Force"], { stdio: 'inherit' })
+    return
+  }
+  const pidFile = join(cfg.stateDir, 'ls.pid')
+  console.log(existsSync(pidFile) ? 'ls pid=' + readText(pidFile).trim() : 'ls not tracked')
+}
+
+async function drive(sub) {
+  const { newConversation, readReply, listConversations } = await import('./driver/session.mjs')
+  const port = Number(flags.port || 0)
+  if (sub === 'list') { console.log(listConversations(cfg, Number(flags.limit || 10)).map((c) => c.id).join('\n')); return }
+  if (sub === 'reply') {
+    const id = positional[1]
+    const txt = await readReply(cfg, id)
+    // 判定走与 divert 同一套引擎（多签名加权 + 交付物判定），别再维护第二份朴素正则
+    const { analyzeRefusal } = await import('./layers/refusal.mjs')
+    const v = analyzeRefusal(txt)
+    console.log(flags.json
+      ? JSON.stringify({ id, chars: txt.length, blocked: /blocked by Gemini/i.test(txt), refused: v.isRefusal, why: v.why, score: v.score })
+      : txt)
+    return
+  }
+  if (sub === 'new') {
+    const prompt = positional.slice(1).join(' ')
+    const cwd = flags.workspace || process.cwd()
+    const projectId = flags.project
+    if (!port) throw new Error('--port=<LS http port> 必填（先 aarmor ls start）')
+    const { id, raw } = newConversation(cfg, prompt, { httpPort: port, csrf: flags.csrf || 'aarmor', projectId, cwd, model: flags.model || 'flash' })
+    if (!id) { console.log(JSON.stringify(raw, null, 2)); return }
+    console.log('conversationId: ' + id)
+    if (flags.wait !== false) {
+      await new Promise((r) => setTimeout(r, Number(flags.waitMs || 45000)))
+      const txt = await readReply(cfg, id)
+      console.log('blocked=' + /blocked by Gemini/i.test(txt) + ' chars=' + txt.length)
+      console.log(txt.slice(0, Number(flags.head || 1200)))
+    }
+  }
+}
+
+function rollback() {
+  const layer = flags.layer || 'binary'
+  if (layer === 'binary') console.log('restored ' + rollbackBinary(cfg))
+  else if (layer === 'ide') console.log('restored ' + rollbackIde(cfg))
+  else {
+    const tag = layer === 'rules' ? 'pre-rules' : layer === 'hooks' ? 'pre-hooks' : 'pre-' + layer
+    const bs = listBackups(cfg.backupDir, tag)
+    if (!bs.length) throw new Error('no backups tagged ' + tag)
+    console.log(bs.slice(0, 10).map((b) => b.path).join('\n'))
+  }
+}
+
+/** aarmor ensure —— 幂等自愈（移植 dsh-purge reapplyInstalled）：
+ *  刷新过期备份 → 还原原件 → 重打 → 复核 → 打戳。默认 dry-run，--apply 落盘。
+ *  退出码：0=已对齐或修好了；1=有 blocked/deferred（CI 门禁可用）。 */
+async function ensureCmd() {
+  const ws = flags.workspaces ? String(flags.workspaces).split(',') : null
+  const r = await ensureArmor(cfg, { apply: !!flags.apply, force: !!flags.force, workspaces: ws })
+  console.log('\nensure ' + (r.noop ? '(noop)' : r.skipped ? '（跳过：' + r.skipped + '）' : ''))
+  for (const n of r.notes) console.log('  ' + n)
+  if (r.changed.length) console.log('\nchanged: ' + r.changed.join(', '))
+  if (r.deferred.length) console.log('\n⚠ 被占用：' + r.deferred.map((d) => d.layer).join(',') + ' —— 关掉 Antigravity 后重跑')
+  if (r.needsRestart) console.log('重启 Antigravity 后生效。')
+  if (!r.ok) process.exitCode = 1
+}
+
+/** aarmor uninstall —— 全量还原（移植 dsh-purge lib/uninstall.js）。默认 dry-run。 */
+async function uninstallCmd() {
+  const apply = !!flags.apply
+  const rows = uninstallArmor(cfg, { apply, workspaces: flags.workspaces ? String(flags.workspaces).split(',') : null })
+  console.log('\nuninstall (' + (apply ? 'APPLY' : 'DRY RUN') + ')')
+  for (const r of rows) {
+    console.log('  ' + String(r.step).padEnd(7) + ' ' + String(r.action).padEnd(8) + ' ' + r.path + (r.note ? '  (' + r.note + ')' : ''))
+  }
+  if (!apply) {
+    console.log('\nDRY RUN：加 --apply 真卸（还原 binary/asar、摘除 rules/hooks 注入、恢复席位词包、清戳）。')
+    return
+  }
+  try { divertAutostart('uninstall') } catch (e) { log.warn('autostart: ' + e.message) }
+  spawnSync('powershell', ['-NoProfile', '-Command', "Get-CimInstance Win32_Process -Filter \"Name = 'node.exe'\" | Where-Object { $_.CommandLine -like '*divert run*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"], { timeout: 30000 })
+  log.ok('已摘除 divert 自启并停掉代理')
+  console.log('\n卸载完成 —— Antigravity 回官方通道，重启 IDE 生效。')
+}
+
+/** aarmor armor status|edit|reset —— 提示词覆盖位（移植 dsh-purge prompt-inject.md） */
+async function armorCmd(sub) {
+  sub = sub || 'status'
+  if (sub === 'status') {
+    const s = armorStatus(cfg)
+    console.log('armor 正文（注入位生效内容）')
+    console.log('  来源      : ' + (s.customized ? '用户副本 ' + s.paths.user : '种子 ' + s.paths.seed))
+    console.log('  已定制    : ' + (s.customized ? 'yes' : 'no'))
+    console.log('  种子变更  : ' + (s.seedChanged ? 'yes —— 可 armor reset 吃新种子，或手工合并' : 'no'))
+    console.log('  字节      : ' + s.bytes)
+    console.log('  种子 sha  : ' + String(s.seedHashNow || '').slice(0, 16))
+    if (s.updatedAt) console.log('  更新时间  : ' + s.updatedAt)
+    return
+  }
+  if (sub === 'set') {
+    // aarmor armor set --file=D:\path\prompt.md [--allow-hot]
+    const file = flags.file
+    if (!file) throw new Error('用法：aarmor armor set --file=<path> [--allow-hot]')
+    const { writeOverride } = await import('./layers/seat.mjs')
+    const { scanHotWords } = await import('./layers/gemini-retry.mjs')
+    const text = readText(file)
+    const hot = scanHotWords(text)
+    const bytes = Buffer.byteLength(text, 'utf8')
+    const r = writeOverride(cfg, text)
+    console.log('已写入注入位：' + r.path)
+    console.log('  来源文件  : ' + file)
+    console.log('  字节      : ' + bytes + '  ≈tokens ' + Math.round(bytes / 3.2))
+    console.log('  热词      : ' + (hot.length ? hot.join(', ') : '0'))
+    if (hot.length && !flags['allow-hot']) {
+      console.log('  ⚠ 有热词：请求级注入会被闸门拒（回落到安全指令）。')
+      console.log('    要么改词，要么在 armor.config.json 的 divert 里加 "seatAllowHot": true。')
+    } else if (hot.length) {
+      console.log('  已允许热词注入（seatAllowHot 生效需配置里有该字段）。')
+    }
+    console.log('  A 层：下一发请求即生效（divert 按 mtime 热加载）')
+    console.log('  B 层：node src/cli.mjs rollback --layer=rules && node src/cli.mjs install --layer=rules --apply')
+    return
+  }
+  if (sub === 'edit') {
+    const r = armorEdit(cfg)
+    console.log('已建立用户副本：' + r.user)
+    console.log('改完跑 `aarmor install --layer=rules --apply`（或 aarmor ensure --apply）部署。')
+    return
+  }
+  if (sub === 'reset') {
+    const r = armorReset(cfg)
+    console.log('已丢弃用户副本，回到种子 ' + r.seed + '（' + r.bytes + 'B）')
+    return
+  }
+  throw new Error('未知子命令 ' + sub + '（status/edit/reset）')
+}
+
+async function evalCmd(sub) {
+  const { runEval } = await import('./eval/index.mjs')
+  return runEval({ sub: sub || 'report', flags, cfg })
+}
+
+async function probeCmd(sub) {
+  const { runProbe } = await import('./probe/index.mjs')
+  return runProbe({ sub: sub || 'measure', flags, cfg })
+}
+
+/** aarmor rules audit|disarm —— 注入位词包审计与外来词包摘除（v1.8.3）
+ *
+ *  出站 <user_rules> 里的内容就是从这些磁盘文件生成的（客户端每轮重建），
+ *  所以这里才是根因所在；出站剥离只是止血。 */
+async function rulesCmd(sub) {
+  const rows = scanRuleFiles(cfg)
+  const fmt = (n) => String(n).padStart(7)
+  if (!sub || sub === 'audit') {
+    console.log('注入位词包审计 —— 每次请求 <user_rules> 里的内容就是从这里来的')
+    let total = 0
+    for (const r of rows) {
+      if (!r.exists) { console.log('  [缺] ' + r.path); continue }
+      console.log((r.foreignBytes ? 'DRIFT ' : 'ok    ') + fmt(r.bytes) + 'B  ' + r.path)
+      for (const b of r.blocks || []) console.log('        块 ' + (b.kind === 'ours' ? '自家' : '外来') + '  ' + b.name + '  ' + b.bytes + 'B')
+      for (const f of r.foreign || []) console.log('        ★外来词包 ' + f.name + '  ' + f.bytes + 'B  ← 每轮都进请求的 <user_rules>')
+      if (r.hotWords && r.hotWords.length) console.log('        触发词 ' + r.hotWords.join(','))
+      total += r.foreignBytes || 0
+    }
+    console.log('')
+    console.log(total
+      ? '外来词包合计 ' + total + 'B —— 这些每轮都随请求发给上游。摘除：aarmor rules disarm --apply'
+      : '无外来词包。')
+    return
+  }
+  if (sub === 'disarm') {
+    const apply = flags.apply === true || flags.apply === 'true'
+    for (const r of disarmAll(cfg, { apply })) {
+      console.log((r.applied ? '已摘除 ' : r.changed ? '待摘除 ' : '跳过   ') + fmt(r.removed || 0) + 'B  ' + r.path
+        + (r.reason ? '  (' + r.reason + ')' : '') + (r.names ? '  [' + r.names.join(',') + ']' : ''))
+    }
+    console.log(apply
+      ? '\n已写入。备份在 ' + cfg.backupDir + '（tag pre-foreign-disarm），可回滚。'
+      : '\n预览模式：加 --apply 才写入（写入前自动备份到 ' + cfg.backupDir + '）')
+    return
+  }
+  throw new Error('未知子命令: ' + sub + '（audit/disarm）')
+}
+
+async function seatsCmd(sub) {
+  const { SEATS, renderPack } = await import('./seats/packs.mjs')
+  const { preview, deploy, verify, restore, seatFile } = await import('./seats/deploy.mjs')
+  sub = sub || 'list'
+  const seat = flags.seat || 'gemini'
+  if (!SEATS[seat]) throw new Error('未知席位: ' + seat + '（可选 ' + Object.keys(SEATS).join('/') + '）')
+  const home = flags.home || (seat === 'gemini' ? cfg.geminiHome : process.env[seat.toUpperCase() + '_CONFIG_DIR'])
+  const opts = { controlWord: flags.word, activationReply: flags.reply }
+  if (sub === 'list') {
+    for (const [id, s] of Object.entries(SEATS)) {
+      const h = id === 'gemini' ? cfg.geminiHome : process.env[id.toUpperCase() + '_CONFIG_DIR']
+      console.log('  ' + id.padEnd(10) + ' ' + s.label.padEnd(22) + ' ' + (s.file || '') + '  home=' + (h || '(未解析，用 --home=DIR)'))
+    }
+    return
+  }
+  if (!home) throw new Error('席位 ' + seat + ' 配置目录未解析：用 --home=DIR 指定')
+  if (sub === 'preview') {
+    const pv = preview(seat, home, opts)
+    console.log('seat      ' + pv.seat)
+    console.log('path      ' + pv.path)
+    console.log('exists    ' + pv.exists)
+    console.log('deployed  ' + pv.alreadyDeployed)
+    console.log('sha-after ' + pv.sha256After.slice(0, 16) + '…')
+    console.log('bytes-after ' + Buffer.byteLength(pv.after))
+    return
+  }
+  if (sub === 'deploy') {
+    if (flags.apply) {
+      const r = deploy(seat, home, opts)
+      console.log('deployed  ' + r.path + '  backup=' + (r.backup || 'none') + '  sha=' + r.sha256.slice(0, 16) + '…')
+    } else {
+      console.log('DRY RUN（加 --apply 真写）。预览：')
+      const pv = preview(seat, home, opts)
+      console.log('  path ' + pv.path + '  exists=' + pv.exists + '  alreadyDeployed=' + pv.alreadyDeployed)
+    }
+    return
+  }
+  if (sub === 'verify') {
+    const v = verify(seat, home, opts)
+    console.log((v.ok ? 'ok       ' : 'DRIFT    ') + v.reason + '  ' + (v.sha256 ? v.sha256.slice(0, 16) + '…' : ''))
+    return
+  }
+  if (sub === 'restore') {
+    const r = restore(seat, home)
+    console.log('restored ' + r.restored + '  ' + r.path)
+    return
+  }
+  throw new Error('未知子命令 ' + sub + '（list/preview/deploy/verify/restore）')
+}
+
+// ── journal：六态分布 + provider 归因 ────────────────────────────────────────
+function journalCmd() {
+  const tail = Number(flags.tail || 20)
+  const by = flags.by || 'provider'
+  const sum = summarizeJournal(cfg, 1000)
+  console.log('total      ' + sum.total + ' 回合   拒答率 ' + (sum.denyRate * 100).toFixed(1) + '%')
+  console.log('verdicts   ' + Object.entries(sum.byVerdict).map(([k, v]) => k + '=' + v).join('  '))
+  for (const [p, c] of Object.entries(sum.byProvider || {})) {
+    const total = Object.values(c).reduce((a, b) => a + b, 0)
+    const denied = total - (c.pass || 0)
+    console.log('  ' + p.padEnd(14) + ' total=' + String(total).padEnd(5) + ' 拒答率=' + (total ? (denied / total * 100).toFixed(1) : '0.0') + '%  ' + Object.entries(c).map(([k, v]) => k + '=' + v).join(' '))
+  }
+  console.log('')
+  console.log('最近 ' + tail + ' 条（by=' + by + '）：')
+  for (const e of readJournal(cfg, tail)) {
+    console.log('  ' + String(e.ts || '').slice(11, 19) + '  ' + String(e.verdict).padEnd(9) + String(e.layer || '').padEnd(9) + 'traj=' + String(e.traj || '-').slice(0, 14).padEnd(15) + 'chars=' + String(e.chars || 0).padEnd(6) + (e.words && e.words[0] ? 'words=' + e.words[0] : '') + (e.kind ? '  kind=' + e.kind : ''))
+  }
+}
+
+// ── hud：控制面 + 悬浮窗 ─────────────────────────────────────────────────────
+const hudPidFile = () => join(cfg.hudDir, 'control.pid')
+const hudLog = () => join(cfg.logDir, 'hud-control.log')
+
+function hudProcessAlive() {
+  try {
+    const pid = Number(readText(hudPidFile()).trim())
+    if (!pid) return false
+    process.kill(pid, 0)
+    return true
+  } catch { return false }
+}
+
+function spawnControlPlane() {
+  mkdirSync(cfg.hudDir, { recursive: true })
+  mkdirSync(cfg.logDir, { recursive: true })
+  const out = openSync(hudLog(), 'a')
+  const child = spawn(process.execPath, [join(cfg.projectRoot, 'src', 'hud', 'control.mjs'), '--port=' + (flags.port || cfg.hud.port)], {
+    cwd: cfg.projectRoot, detached: true, stdio: ['ignore', out, out], windowsHide: true,
+  })
+  writeText(hudPidFile(), String(child.pid))
+  child.unref()
+  return child.pid
+}
+
+function spawnHudWindow() {
+  const exe = join(cfg.projectRoot, 'dist', 'hud', 'ArmorHud.exe')
+  if (!existsSync(exe)) {
+    console.log('悬浮窗未构建：powershell -ExecutionPolicy Bypass -File scripts\\build-hud.ps1')
+    return null
+  }
+  const child = spawn(exe, [], { cwd: cfg.projectRoot, detached: true, stdio: 'ignore', windowsHide: false })
+  child.unref()
+  return child.pid
+}
+
+async function hudCmd(sub) {
+  const action = sub || 'status'
+  const runScript = (name, extra = []) => {
+    const r = spawnSync(process.execPath, [join(cfg.projectRoot, 'scripts', name), ...extra], { stdio: 'inherit' })
+    if (r.status !== 0) throw new Error(name + ' 退出码 ' + r.status)
+  }
+  if (action === 'watch') {
+    // 常驻看门狗：页面在、端口开、齿轮不在 → 自动 attach（重启 Antigravity 后齿轮自动回来）
+    const interval = Number(flags.interval || 15) * 1000
+    const { attachAll } = await import('./hud/cdp.mjs')
+    if (!hudProcessAlive()) spawnControlPlane()
+    const token = ensureToken(cfg)
+    const logFile = join(cfg.logDir, 'hud-watch.log')
+    const say = (m) => { try { appendFileSync(logFile, new Date().toISOString() + ' ' + m + '\n') } catch { /* 忽略 */ } }
+    say('watch start interval=' + interval)
+    if (flags.once) {
+      try {
+        const rows = await attachAll(cfg, token, { port: Number(flags.port || 9222) })
+        for (const r of rows) say((r.ok ? 'ok ' : 'fail ') + r.url)
+        console.log(rows.length ? rows.map((r) => (r.ok ? 'ok   ' : 'fail ') + r.url).join('\n') : '没有可注入页面（应用是否带 --remote-debugging-port 启动？）')
+      } catch (e) { console.log('attach 失败：' + e.message) }
+      return
+    }
+    // 脱离父进程常驻
+    if (!flags.foreground) {
+      const out = openSync(logFile, 'a')
+      const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'hud', 'watch', '--foreground', '--interval=' + (flags.interval || 15)], {
+        cwd: cfg.projectRoot, detached: true, stdio: ['ignore', out, out], windowsHide: true,
+      })
+      child.unref()
+      writeText(join(cfg.hudDir, 'watch.pid'), String(child.pid))
+      console.log('watch 已后台启动 pid ' + child.pid + '  日志 ' + logFile)
+      return
+    }
+    for (;;) {
+      try {
+        const rows = await attachAll(cfg, token, { port: Number(flags.port || 9222) })
+        if (rows.length) say('attached ' + rows.map((r) => (r.ok ? 'ok' : 'fail') + ':' + r.url).join(' '))
+      } catch (e) { say('idle ' + e.message) }
+      await new Promise((r) => setTimeout(r, interval))
+    }
+  }
+  if (action === 'fix-shortcuts') {
+    const r = spawnSync(process.execPath, [join(cfg.projectRoot, 'scripts', 'fix-shortcuts.mjs')], { stdio: 'inherit' })
+    if (r.status !== 0) throw new Error('fix-shortcuts 退出码 ' + r.status)
+    return
+  }
+  if (action === 'attach') {
+    const { attachAll } = await import('./hud/cdp.mjs')
+    if (!hudProcessAlive()) spawnControlPlane()
+    const token = ensureToken(cfg)
+    const port = Number(flags.port || 9222)
+    try {
+      const rows = await attachAll(cfg, token, { port })
+      if (!rows.length) console.log('没有可注入的 http(s) 页面：应用是否带 --remote-debugging-port 启动？')
+      for (const r of rows) console.log((r.ok ? 'ok   ' : 'fail ') + r.url + (r.ok ? '  -> ' + r.value : '  ' + r.error))
+    } catch (e) { console.log('attach 失败：' + e.message) }
+    return
+  }
+  if (action === 'shortcut') {
+    const lnk = join(cfg.projectRoot, 'build', 'Antigravity-CDP.lnk')
+    mkdirSync(dirname(lnk), { recursive: true })
+    const ps = `$w=New-Object -ComObject WScript.Shell; $s=$w.CreateShortcut('${lnk}'); $s.TargetPath='${join(cfg.antigravityRoot, 'Antigravity.exe')}'; $s.Arguments='--remote-debugging-port=${flags.port || 9222}'; $s.WorkingDirectory='${cfg.antigravityRoot}'; $s.Save()`
+    const r = spawnSync('powershell', ['-NoProfile', '-Command', ps], { encoding: 'utf8' })
+    if (r.status !== 0) { console.log('创建快捷方式失败：' + (r.stderr || '').slice(0, 200)); return }
+    console.log('已生成：' + lnk)
+    console.log('用它启动 Antigravity（带调试端口），然后 aarmor hud attach')
+    return
+  }
+  if (action === 'embed') {
+    if (!hudProcessAlive()) spawnControlPlane()
+    ensureToken(cfg)
+    console.log('内嵌 UI 路线：CDP 注入（不改宿主文件）')
+    console.log('  1) aarmor hud shortcut            生成带 --remote-debugging-port 的启动快捷方式')
+    console.log('  2) 用该快捷方式启动 Antigravity，再跑 aarmor hud attach')
+    return
+  }
+  if (action === 'unembed') {
+    runScript('install-embedded-hud.mjs', ['--restore', '--apply'])
+    return
+  }
+  if (action === 'floating') {
+    if (!hudProcessAlive()) spawnControlPlane()
+    const w = spawnHudWindow()
+    console.log('floating window pid ' + (w || 'none'))
+    return
+  }
+  if (action === 'start') {
+    const pid = hudProcessAlive() ? Number(readText(hudPidFile()).trim()) : spawnControlPlane()
+    console.log('control plane pid ' + pid + '  http://127.0.0.1:' + (flags.port || cfg.hud.port) + '  token=' + ensureToken(cfg).slice(0, 8) + '…')
+    return
+  }
+  if (action === 'open') {
+    if (!hudProcessAlive()) spawnControlPlane()
+    const token = ensureToken(cfg)
+    const { attachAll } = await import('./hud/cdp.mjs')
+    try {
+      const rows = await attachAll(cfg, token, { port: Number(flags.port || 9222) })
+      if (!rows.length) {
+        console.log('控制面已起（127.0.0.1:' + (cfg.hud.port || 50101) + '），但没有可注入页面：')
+        console.log('  用 aarmor hud shortcut 生成的快捷方式启动 Antigravity（带 --remote-debugging-port），再跑本条')
+        return
+      }
+      for (const r of rows) console.log((r.ok ? 'ok   ' : 'fail ') + r.url)
+    } catch (e) { console.log('控制面已起；attach 失败：' + e.message + '（应用需带 --remote-debugging-port 启动）') }
+    return
+  }
+  if (action === 'stop') {
+    try {
+      const pid = Number(readText(hudPidFile()).trim())
+      if (pid) process.kill(pid)
+      console.log('control plane stopped (pid ' + pid + ')')
+    } catch (e) { console.log('control plane 未在运行：' + e.message) }
+    return
+  }
+  if (action === 'token') { console.log(ensureToken(cfg)); return }
+  if (action === 'lane') {
+    if (positional[1]) console.log('lane -> ' + writeLane(cfg, positional[1]))
+    else console.log('lane = ' + readLane(cfg))
+    return
+  }
+  if (action === 'status') {
+    const s = snapshot(cfg, { traj: flags.traj || null })
+    console.log('control plane ' + (hudProcessAlive() ? 'up  pid=' + readText(hudPidFile()).trim() : 'down'))
+    console.log('url           http://127.0.0.1:' + (cfg.hud.port || 50101) + '   token=' + ensureToken(cfg).slice(0, 8) + '…')
+    console.log('host          ' + s.host.version + '  expectedSize=' + s.host.expectedSize)
+    console.log('layers        binary=' + (s.layers.binary.armored ? 'ARMORED' : 'not') + ' pending=' + s.layers.binary.pending + (s.layers.binary.blocked ? ' blocked=' + s.layers.binary.blocked : '') + '  ide=' + (s.layers.ide.patched ? 'patched' : 'not'))
+    console.log('divert        port=' + s.divert.port + ' lane=' + s.divert.lane + ' sameModel=' + s.divert.sameModel + ' passThrough=' + s.divert.passThrough)
+    console.log('journal       total=' + s.journal.total + ' 拒答率=' + (s.journal.denyRate * 100).toFixed(1) + '%  ' + Object.entries(s.journal.byVerdict).map(([k, v]) => k + '=' + v).join(' '))
+    console.log('seat          ' + s.seat.chars + 'B hash=' + s.seat.hash + '  queued=' + s.queued.length)
+    if (s.controller) console.log('controller    verdict=' + s.controller.verdict + ' streak=' + s.controller.streak + ' inj=' + s.controller.interventions.injections)
+    return
+  }
+  throw new Error('未知 hud 子命令 ' + action + '（start/open/stop/status/token/lane）')
+}
+
+const commands = { status, verify, install, divert, ls, drive, rollback, ensure: ensureCmd, uninstall: uninstallCmd, armor: armorCmd, netcheck: netcheckCmd, lsnet: lsnetCmd, eval: evalCmd, probe: probeCmd, seats: seatsCmd, rules: rulesCmd, journal: journalCmd, hud: hudCmd }
+const SUBCOMMANDS = new Set(['divert', 'ls', 'drive', 'eval', 'probe', 'seats', 'rules', 'armor', 'hud'])
+const handler = commands[cmd]
+if (!handler) {
+  console.log(`antigravity-armor
+
+  aarmor status                       各层状态总览
+  aarmor install [--apply] [--layer=binary|rules|hooks|ide] [--workspaces=a,b]
+  aarmor ensure [--apply] [--force] [--workspaces=a,b]
+                                       幂等自愈：刷新过期备份 → 还原原件 → 重打 → 复核 → 打戳
+                                       （Antigravity 升级后跑这一条即可；autostart 会每 5 分钟顺带跑）
+  aarmor uninstall [--apply]          全量还原：binary/asar/rules/hooks/席位词包/清戳
+  aarmor verify [--json]              审计锚点/注册表/purge 戳
+  aarmor rollback --layer=binary|ide|rules|hooks
+  aarmor armor status|edit|reset      提示词覆盖位（用户副本优先于 assets/armor.md 种子）
+  aarmor divert start|stop|status|restart|log [--port=50100] [--model=] [--target=]
+  aarmor divert ensure                幂等保活：代理不在就拉起，在监听就静默退出（供计划任务调用）  aarmor divert autostart install|uninstall|status
+                                      登录自启 + 每 5 分钟兜底 —— 代理一没，IDE 连账号都登录不上
+  aarmor netcheck [--proxy=http://127.0.0.1:7897]
+                                      出口体检：divert 的流量有没有走代理 + 出口 IP 信誉（机房 ASN/受限地区）
+  aarmor lsnet [--timeout=4000]       语言服务器出站体检：直连 / 环境变量代理 / LS 日志判读
+  aarmor ls start|stop [--port=50095]
+  aarmor drive new "<prompt>" --port=<LS_HTTP> [--workspace=DIR] [--project=ID]
+  aarmor drive reply <conversationId> [--json]
+  aarmor drive list
+  aarmor eval build|verify|scan|report|diff|manifest [--dir=DIR] [--view=both] [--agent=FILE] [--json]
+  aarmor probe bank|measure [--attempts=N] [--target=URL] [--json]   破甲跑分（离线 mock / 真实端点）
+  aarmor seats list|preview|deploy|verify|restore [--seat=gemini] [--home=DIR] [--apply]  席位词包（就地破甲，不换模型）
+  aarmor rules audit|disarm [--apply] 注入位词包审计 / 摘除外来词包（每轮 <user_rules> 都从这些文件生成）
+  aarmor journal [--tail=20] [--by=provider]
+                                      六态分布 + provider 归因（含 pass 分母）
+  aarmor hud embed|unembed|open|floating|start|stop|status|token|lane [--port=50101]
+                                      内嵌 UI（默认）：解包 app.asar，把 dock 注入渲染页
+                                      floating = 旧的独立悬浮窗；start/stop 管控制面
+
+环境变量: AARMOR_LOG=debug|info|warn|error, AARMOR_LOG_FILE, ${cfg.divert.keyRef}`)
+  process.exit(1)
+}
+await handler(SUBCOMMANDS.has(cmd) ? positional[0] : undefined)
