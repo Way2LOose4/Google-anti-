@@ -508,6 +508,8 @@ export function createDivertServer(cfg, opts = {}) {
       const u = new URL(upstream)
       const headers = { ...req.headers }
       delete headers.host; delete headers['content-length']
+      // 账号资格接口要看原文：gzip 会把 JSON 变成不可读字节流，抓包前先让上游回明文
+      if (/loadCodeAssist/i.test(String(req.url))) delete headers['accept-encoding']
       const preq = https.request({ host: u.hostname, port: 443, method: req.method, path: req.url, headers: { ...headers, host: u.hostname, 'content-length': body.length } }, (pres) => {
         // v1.7.6：这条回退分支是**账号接口**（loadCodeAssist / ListExperiments / onboardUser …）的必经之路，
         // 以前转发完一个字都不记 —— 于是「账号一直在 401」在 divert 日志里完全隐形（实测 09:03–11:29 全空），
@@ -546,7 +548,27 @@ export function createDivertServer(cfg, opts = {}) {
             } catch { /* 忽略 */ }
           })
         }
-        res.writeHead(code, pres.headers); pres.pipe(res)
+        res.writeHead(code, pres.headers)
+        // v1.9.1：账号资格（loadCodeAssist）此前只记状态码 —— 「200 但 tier 为空」这种
+        // 「登录成功却用不了」的判定在日志里完全隐形，只能靠 IDE 侧反推。落一份原文备查。
+        if (/loadCodeAssist/i.test(String(req.url))) {
+          const chunks = []
+          pres.on('data', (c) => { chunks.push(c); try { res.write(c) } catch { /* 客户端可能已断 */ } })
+          pres.on('end', () => {
+            try {
+              const raw = Buffer.concat(chunks)
+              mkdirSync(cfg.captureDir, { recursive: true })
+              const f = join(cfg.captureDir, 'loadCodeAssist.bin')
+              writeFileSync(f, raw)
+              say('LCA-DUMP ' + raw.length + 'B -> ' + f)
+              say('LCA-BODY ' + raw.toString('utf8').replace(/\s+/g, ' ').slice(0, 600))
+            } catch { /* 忽略 */ }
+            try { res.end() } catch { /* 忽略 */ }
+          })
+          pres.on('error', () => { try { res.end() } catch { /* 忽略 */ } })
+        } else {
+          pres.pipe(res)
+        }
       })
       preq.on('error', (e) => { say('PASS-ERR ' + e.message); if (!res.headersSent) res.writeHead(502); res.end('{}') })
       preq.end(body)
