@@ -41,11 +41,22 @@ powershell -ExecutionPolicy Bypass -File scripts\install-home.ps1
 参数：
 
 ```powershell
+-CheckOnly                               # 只探测不安装，先看环境对不对
 -AntigravityRoot "D:\Apps\antigravity"   # 装到非默认位置时
 -NodeExe "C:\Program Files\nodejs\node.exe"
 -SkipServices                            # 只装文件，不起常驻进程
 -NoAutostart                             # 不写登录自启计划任务
 ```
+
+第一步永远先跑：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-home.ps1 -CheckOnly
+```
+
+它只读不写，打印 node 路径、宿主目录、宿主版本、`language_server.exe` 的 size/sha256、是否已破甲、补丁表是否存在。都对了再正式装。
+
+> 脚本会检测二进制里有没有 `**[ARMOR v3]` 标记：**已破甲就不覆盖 config 里的原始指纹**（否则家里重装时 `assertHostShape` 会因为 sha 不匹配直接拒绝）。
 
 ---
 
@@ -164,7 +175,7 @@ PASS-NARROW attempt=0 保留 2 条（丢 22 条）截断工具回包 15 处
 | `src/layers/hooks.mjs` | `buildHooksJson()` 用 `process.execPath` 代替 `'node '` | 宿主 PATH 无 node 时 hook 全崩，见 5.1 |
 | `armor.config.json` | 路径/size/sha 指向本机；`passThrough:true`、`sameModel:false`、`maxAttempts:3`、`narrow*` 调宽 | 见 5.2 / 5.3 |
 | `patches/hosts/2.35.1/binary-patches.json` | 新增（由 2.34.0 表在本机 2.35.1 上 derive，61 处生效 / 4 条 miss） | 上游只到 2.34.0 |
-| `scripts/install-home.ps1`、`scripts/set-home-config.mjs` | 新增 | 换机器一条命令装完 |
+| `scripts/install-home.ps1`、`scripts/set-home-config.mjs`、`scripts/host-fingerprint.mjs` | 新增 | 换机器一条命令装完；指纹探测单独成脚本（PS 5.1 传 `-e` 会吃引号） |
 | `aarmor.cmd` | 去掉硬编码 node 路径，改为多路探测 | 便携 |
 
 > `state/`、`build/`、`*.bak-*` 不入库：前者是 400MB 运行时数据（含二进制备份和 token 抓包），后者是产物与图片。

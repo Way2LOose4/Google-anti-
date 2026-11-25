@@ -1,6 +1,7 @@
-﻿# armor 家用安装：自动探测本机 Antigravity / node，改 config，装六层，起服务。
+﻿# armor 家用安装：自动探测本机 Antigravity / node，改 config，装四层，起服务。
 # 用法（在仓库根目录）：
 #   powershell -ExecutionPolicy Bypass -File scripts\install-home.ps1
+#   powershell -ExecutionPolicy Bypass -File scripts\install-home.ps1 -CheckOnly    # 只看探测结果
 # 可选参数：
 #   -AntigravityRoot "C:\Users\xxx\AppData\Local\Programs\antigravity"   手动指定宿主目录
 #   -NodeExe "C:\Program Files\nodejs\node.exe"                          手动指定 node
@@ -10,7 +11,8 @@ param(
   [string]$AntigravityRoot = '',
   [string]$NodeExe = '',
   [switch]$SkipServices,
-  [switch]$NoAutostart
+  [switch]$NoAutostart,
+  [switch]$CheckOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,7 +34,7 @@ function Find-NodeExe([string]$Hint) {
     (Join-Path $env:ProgramFiles 'nodejs\node.exe'),
     (Join-Path ${env:ProgramFiles(x86)} 'nodejs\node.exe'),
     (Join-Path $env:LOCALAPPDATA 'Programs\nodejs\node.exe'),
-    (Join-Path $env:USERPROFILE 'AppData\Roaming\npm\node.exe')
+    (Join-Path $env:APPDATA 'npm\node.exe')
   )
   $wb = Join-Path $env:USERPROFILE '.workbuddy\binaries\node\versions'
   if (Test-Path $wb) {
@@ -73,24 +75,12 @@ function Find-AntigravityRoot([string]$Hint) {
   throw '找不到 Antigravity 安装目录。请用 -AntigravityRoot "…\Programs\antigravity" 指定。'
 }
 
-# ---------- 3. 宿主版本 ----------
-function Get-HostVersion([string]$root) {
-  $asar = Join-Path $root 'resources\app.asar'
-  if (Test-Path $asar) {
-    $txt = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($asar))
-    $m = [regex]::Match($txt, '"name"\s*:\s*"antigravity"')
-    if ($m.Success) {
-      $len = [Math]::Min(400, $txt.Length - $m.Index)
-      $mv = [regex]::Match($txt.Substring($m.Index, $len), '"version"\s*:\s*"([^"]+)"')
-      if ($mv.Success) { return $mv.Groups[1].Value }
-    }
-  }
-  $vf = Join-Path $root 'resources\version'
-  if (Test-Path $vf) {
-    $v = (Get-Content $vf -Raw).Trim()
-    if ($v) { return $v }
-  }
-  return 'unknown'
+# ---------- 3. 宿主指纹（版本 / 尺寸 / sha256 / 是否已破甲）----------
+function Get-HostFingerprint($nodeExe, $root) {
+  $json = (& $nodeExe (Join-Path $repo 'scripts\host-fingerprint.mjs') $root) -join "`n"
+  $fp = $json | ConvertFrom-Json
+  if ($fp.error) { throw $fp.error }
+  return $fp
 }
 
 # ================= 开始 =================
@@ -108,20 +98,49 @@ $agRoot = Find-AntigravityRoot $AntigravityRoot
 Say "  root   = $agRoot"
 
 Step 3 '读取宿主版本与二进制指纹'
-$ver = Get-HostVersion $agRoot
-$lsExe = Join-Path $agRoot 'resources\bin\language_server.exe'
-if (-not (Test-Path $lsExe)) { throw "找不到 $lsExe" }
-$size = (Get-Item $lsExe).Length
+Say '  扫描 app.asar 与 language_server.exe（200MB 左右，几秒）…'
+$fp = Get-HostFingerprint $node $agRoot
+$ver = $fp.hostVersion
+$lsExe = $fp.exe
+$size = $fp.size
+$sha = $fp.sha256
+$armored = [bool]$fp.armored
+$marker = $fp.marker
 Say "  版本   = $ver"
 Say "  LS     = $size B"
-Say '  正在算 sha256（200MB 左右，几秒）…'
-$sha = (Get-FileHash $lsExe -Algorithm SHA256).Hash
 Say "  sha256 = $sha"
+
+$writeSize = $size
+$writeSha = $sha
+if ($armored) {
+  Say "  状态   = 已破甲（含 marker $marker）：保留 config 里的原始指纹，不覆盖" 'Yellow'
+  Say '           要重装请先 node src\cli.mjs rollback --layer=binary' 'Yellow'
+  $writeSize = ''
+  $writeSha = ''
+} else {
+  Say '  状态   = 未打补丁（原始宿主）：用当前指纹写入 config'
+}
 
 Step 4 '写入 armor.config.json（路径 / 尺寸 / sha）'
 $geminiHome = Join-Path $env:USERPROFILE '.gemini'
 $dshHome = Join-Path $env:USERPROFILE '.dsh'
-& $node (Join-Path $repo 'scripts\set-home-config.mjs') (Join-Path $repo 'armor.config.json') $agRoot $geminiHome $dshHome $size $sha
+
+if ($CheckOnly) {
+  $tableProbe = Join-Path $repo "patches\hosts\$ver\binary-patches.json"
+  Say ''
+  Say '===== 仅探测（-CheckOnly，未做任何改动）=====' 'Green'
+  Say "  node            = $node ($nodeVer)"
+  Say "  AntigravityRoot = $agRoot"
+  Say "  宿主版本        = $ver"
+  Say "  language_server = $size B"
+  Say "  sha256          = $sha"
+  Say "  已破甲          = $armored"
+  Say "  geminiHome      = $geminiHome"
+  Say "  补丁表          = $(if (Test-Path $tableProbe) { '已有 ' + $tableProbe } else { '缺，需要 derive' })"
+  return
+}
+
+& $node (Join-Path $repo 'scripts\set-home-config.mjs') (Join-Path $repo 'armor.config.json') $agRoot $geminiHome $dshHome $writeSize $writeSha
 if ($LASTEXITCODE -ne 0) { throw 'set-home-config 失败' }
 
 Step 5 "确认 $ver 的补丁表"
@@ -137,7 +156,7 @@ if (Test-Path $table) {
   }
 }
 
-Step 6 '安装六层（binary / ide / rules / hooks）'
+Step 6 '安装四层（binary / ide / rules / hooks）'
 & $node (Join-Path $repo 'src\cli.mjs') install --apply
 if ($LASTEXITCODE -ne 0) { throw 'install 失败' }
 
@@ -166,4 +185,4 @@ Say '  1) 关掉所有 Antigravity 进程，用 build\Antigravity-CDP.lnk 启动
 Say '  2) IDE 起来后跑:  node src\cli.mjs hud attach     # 注入齿轮'
 Say '  3) 齿轮变绿 = 破甲生效'
 Say ''
-Say '注意：hooks 用当前 node 的绝对路径写进 hooks.json。换 node 版本后重跑本脚本或 install --layer=hooks --apply。'
+Say '注意：hooks 会写入当前 node 的绝对路径。换 node 版本后重跑 install --layer=hooks --apply。'
